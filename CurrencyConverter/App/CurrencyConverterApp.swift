@@ -6,18 +6,32 @@
 //
 
 import SwiftUI
-import Combine
 
 @main
 struct CurrencyConverterApp: App {
-    
+
     var body: some Scene {
+
         WindowGroup {
-            NavigationView {
-                let currencyRepository = CurrencyRepository(apiService: CurrencyAPIService(), storageService: CoreDataService())
-                let viewModel = CurrencyConverterViewModel(currencyRepository: currencyRepository)
-                CurrencyConverterView(viewModel: viewModel)
-            }
+            mainView()
         }
+    }
+}
+
+extension CurrencyConverterApp {
+    func mainView() -> CurrencyConverterView {
+        let configuration = APIConfiguration.default
+
+        let client = URLSessionHTTPClient()
+
+        let remote = RESTCurrencyRemoteDataSource(
+            client: client,
+            configuration: configuration
+        )
+
+        let local = SwiftDataCurrencyLocalDataSource(modelContainer: SwiftDataStack.shared)
+        let repository = CurrencyRepository(remote: remote,local: local, freshnessStore: UserDefaultsRateFreshnessStore())
+        let vm = CurrencyConverterViewModel(repository: repository, networkMonitor: NetworkMonitor())
+        return CurrencyConverterView(viewModel: vm)
     }
 }

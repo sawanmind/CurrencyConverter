@@ -1,133 +1,136 @@
-//
-//  CurrencyListViewModelTests.swift
-//  CurrencyConverterTests
-//
-//  Created by Sawan Kumar on 08/02/25.
-//
-
 import XCTest
-import Combine
 @testable import CurrencyConverter
 
-class CurrencyListViewModelTests: XCTestCase {
-    var viewModel: CurrencyListViewModel!
-    var mockAPIService: MockCurrencyAPIService!
-    var mockStorageService: MockCoreDataService!
-    var mockRepository: MockCurrencyRepository!
-    private var cancellables = Set<AnyCancellable>()
+private final class MockRepository: CurrencyRepositoryProtocol, @unchecked Sendable {
+    var baseCurrency: String = "USD"
+    var stubbedResult: Result<[Currency], Error> = .success([])
+
+    func fetchRates() async throws -> [Currency] {
+        try stubbedResult.get()
+    }
+}
+
+private final class MockNetworkMonitor: NetworkMonitoring {
+    var isConnected: AsyncStream<Bool> { AsyncStream { _ in } }
+}
+
+@MainActor
+private final class MockSelectionDelegate: CurrencySelectionDelegate {
+    private(set) var selectedCurrency: Currency?
+    func selected(_ currency: Currency) { selectedCurrency = currency }
+}
+
+@MainActor
+final class CurrencyListViewModelTests: XCTestCase {
+
+    private var repository: MockRepository!
+    private var networkMonitor: MockNetworkMonitor!
+    private var sut: CurrencyListViewModel!
 
     override func setUp() {
         super.setUp()
-        mockAPIService = MockCurrencyAPIService()
-        mockStorageService = MockCoreDataService()
-        mockRepository = MockCurrencyRepository(apiService: mockAPIService, storageService: mockStorageService)
-        viewModel = CurrencyListViewModel(currencyRepository: mockRepository, baseCurrency: "USD")
+        repository = MockRepository()
+        networkMonitor = MockNetworkMonitor()
+        sut = CurrencyListViewModel(repository: repository, delegate: nil, networkMonitor: networkMonitor)
     }
 
     override func tearDown() {
-        viewModel = nil
-        mockRepository = nil
-        cancellables.removeAll()
+        sut = nil
+        networkMonitor = nil
+        repository = nil
         super.tearDown()
     }
 
-    // Ensures the ViewModel starts with empty values.
-    func testInitialState() {
-        XCTAssertTrue(viewModel.currencies.isEmpty, "Currencies should be empty initially")
-        XCTAssertTrue(viewModel.filteredCurrencies.isEmpty, "Filtered currencies should be empty initially")
-        XCTAssertEqual(viewModel.searchText, "", "Search text should be empty initially")
+    func testLoadSetsStateToLoadedOnSuccess() async {
+        let currencies = [Currency(code: "USD", name: "US Dollar", value: 1.0)]
+        repository.stubbedResult = .success(currencies)
+
+        await sut.load()
+
+        XCTAssertEqual(sut.state, .loaded(currencies))
     }
 
-    // Checks if currencies are fetched correctly and stored.
-    func testFetchCurrencies() {
-        let expectation = expectation(description: "Currencies should be fetched and stored")
+    func testLoadSetsStateToEmptyWhenRepositoryReturnsNoCurrencies() async {
+        repository.stubbedResult = .success([])
 
-        mockRepository.currencies = [
+        await sut.load()
+
+        XCTAssertEqual(sut.state, .empty)
+    }
+
+    func testLoadSetsStateToErrorOnFailure() async {
+        repository.stubbedResult = .failure(APIError.networkUnavailable)
+
+        await sut.load()
+
+        if case .error = sut.state { } else {
+            XCTFail("Expected .error state, got \(sut.state)")
+        }
+    }
+
+    func testSearchTextFiltersResultsByCode() async {
+        repository.stubbedResult = .success([
             Currency(code: "USD", name: "US Dollar", value: 1.0),
             Currency(code: "EUR", name: "Euro", value: 0.92),
-            Currency(code: "INR", name: "Indian Rupee", value: 83.27)
-        ]
+        ])
+        await sut.load()
 
-        viewModel.fetchCurrencies()
+        sut.searchText = "USD"
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            XCTAssertEqual(self.viewModel.currencies.count, 3, "Currencies count mismatch after fetch")
-            XCTAssertEqual(self.viewModel.filteredCurrencies.count, 3, "Filtered currencies should match initially")
-            expectation.fulfill()
-        }
-
-        wait(for: [expectation], timeout: 1)
+        XCTAssertEqual(sut.state, .loaded([Currency(code: "USD", name: "US Dollar", value: 1.0)]))
     }
 
-    // Tests if filtering works correctly based on search input.
-    func testSearchTextFiltering() {
-        viewModel.currencies = [
+    func testSearchTextFiltersResultsByName() async {
+        repository.stubbedResult = .success([
             Currency(code: "USD", name: "US Dollar", value: 1.0),
             Currency(code: "EUR", name: "Euro", value: 0.92),
-            Currency(code: "INR", name: "Indian Rupee", value: 83.27)
-        ]
+        ])
+        await sut.load()
 
-        viewModel.searchText = "USD"
-        XCTAssertEqual(viewModel.filteredCurrencies.count, 1, "Filtered list should contain only USD")
-        XCTAssertEqual(viewModel.filteredCurrencies.first?.code, "USD", "Incorrect search result for 'USD'")
+        sut.searchText = "Euro"
 
-        viewModel.searchText = "eur"
-        XCTAssertEqual(viewModel.filteredCurrencies.count, 1, "Filtered list should contain only EUR")
-        XCTAssertEqual(viewModel.filteredCurrencies.first?.code, "EUR", "Incorrect search result for 'eur'")
-
-        viewModel.searchText = "ind"
-        XCTAssertEqual(viewModel.filteredCurrencies.count, 1, "Filtered list should contain only INR")
-        XCTAssertEqual(viewModel.filteredCurrencies.first?.code, "INR", "Incorrect search result for 'ind'")
-
-        viewModel.searchText = "ZZZ"
-        XCTAssertTrue(viewModel.filteredCurrencies.isEmpty, "Search should return an empty list for unknown text")
+        XCTAssertEqual(sut.state, .loaded([Currency(code: "EUR", name: "Euro", value: 0.92)]))
     }
 
-    // Ensures that clearing the search resets the filtered list.
-    func testSearchClearedResetsFilter() {
-        viewModel.currencies = [
+    func testSearchTextIsCaseInsensitive() async {
+        repository.stubbedResult = .success([Currency(code: "USD", name: "US Dollar", value: 1.0)])
+        await sut.load()
+
+        sut.searchText = "usd"
+
+        XCTAssertEqual(sut.state, .loaded([Currency(code: "USD", name: "US Dollar", value: 1.0)]))
+    }
+
+    func testSearchTextSetsEmptyStateWhenNoMatchFound() async {
+        repository.stubbedResult = .success([Currency(code: "USD", name: "US Dollar", value: 1.0)])
+        await sut.load()
+
+        sut.searchText = "XYZ"
+
+        XCTAssertEqual(sut.state, .empty)
+    }
+
+    func testSearchTextShowsAllCurrenciesWhenSearchFieldIsEmpty() async {
+        let currencies = [
             Currency(code: "USD", name: "US Dollar", value: 1.0),
-            Currency(code: "EUR", name: "Euro", value: 0.92)
+            Currency(code: "EUR", name: "Euro", value: 0.92),
         ]
+        repository.stubbedResult = .success(currencies)
+        await sut.load()
+        sut.searchText = "USD"
 
-        viewModel.searchText = "USD"
-        XCTAssertEqual(viewModel.filteredCurrencies.count, 1, "Filtered list should contain 1 match")
+        sut.searchText = ""
 
-        viewModel.searchText = ""
-        XCTAssertEqual(viewModel.filteredCurrencies.count, 2, "Clearing search should reset filtered list")
+        XCTAssertEqual(sut.state, .loaded(currencies))
     }
 
-    // Ensures selecting a currency triggers an update via EventBus.
-    func testSelectCurrency() {
-        let expectation = expectation(description: "Currency selection should be sent to EventBus")
-        let mockCurrency = Currency(code: "USD", name: "US Dollar", value: 1.0)
+    func testSelectedNotifiesDelegate() async {
+        let delegate = MockSelectionDelegate()
+        sut = CurrencyListViewModel(repository: repository, delegate: delegate, networkMonitor: networkMonitor)
+        let currency = Currency(code: "EUR", name: "Euro", value: 0.92)
 
-        let eventBusCancellable = EventBus.shared.currencySelected
-            .first()
-            .sink { selectedCode in
-                XCTAssertEqual(selectedCode, "USD", "Selected currency should be 'USD'")
-                expectation.fulfill()
-            }
+        sut.selected(currency)
 
-        viewModel.selectCurrency(mockCurrency)
-
-        wait(for: [expectation], timeout: 1)
-        eventBusCancellable.cancel()
-    }
-
-    // Tests behavior when fetching an empty currency list.
-    func testFetchEmptyCurrencies() {
-        let expectation = expectation(description: "Fetching empty currencies should work correctly")
-
-        mockRepository.exchangeRates = []
-        viewModel.fetchCurrencies()
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            XCTAssertTrue(self.viewModel.currencies.isEmpty, "Currencies should be empty after fetching empty data")
-            XCTAssertTrue(self.viewModel.filteredCurrencies.isEmpty, "Filtered currencies should be empty")
-            expectation.fulfill()
-        }
-
-        wait(for: [expectation], timeout: 1)
+        XCTAssertEqual(delegate.selectedCurrency, currency)
     }
 }
